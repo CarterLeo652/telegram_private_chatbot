@@ -1000,11 +1000,33 @@ async function handleAdminReply(msg, env, ctx) {
           "📖 `/help` - 查看本帮助"
       ].join("\n");
 
+      const helpKeyboard = [
+          [{ text: "/close" }, { text: "/open" }, { text: "/info" }],
+          [{ text: "/ban" }, { text: "/unban" }],
+          [{ text: "/trust" }, { text: "/reset" }],
+          [{ text: "/cleanup" }, { text: "/help" }],
+          [{ text: "❎ 隐藏菜单" }]
+      ];
+
       await tgCall(env, "sendMessage", {
           chat_id: env.SUPERGROUP_ID,
           message_thread_id: threadId,
           text: helpText,
-          parse_mode: "Markdown"
+          parse_mode: "Markdown",
+          reply_markup: {
+              keyboard: helpKeyboard,
+              resize_keyboard: true
+          }
+      });
+      return;
+  }
+
+  if (text === "❎ 隐藏菜单") {
+      await tgCall(env, "sendMessage", {
+          chat_id: env.SUPERGROUP_ID,
+          message_thread_id: threadId,
+          text: "✅ 已隐藏快捷菜单",
+          reply_markup: { remove_keyboard: true }
       });
       return;
   }
