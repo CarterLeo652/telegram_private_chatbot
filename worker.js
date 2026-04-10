@@ -432,9 +432,30 @@ async function renderTurnstileVerifyPage(request, env) {
 </main>
 <script>
 let turnstileToken = "";
-function onTurnstileDone(token){ turnstileToken = token; document.getElementById("submit-btn").disabled = false; }
+let submitting = false;
+let verifiedDone = false;
+const submitBtn = document.getElementById("submit-btn");
+function setVerifiedUI(text) {
+  verifiedDone = true;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "已完成验证";
+  const status = document.getElementById("status");
+  status.textContent = text || "✅ 已验证，无需重复提交。";
+}
+function onTurnstileDone(token){
+  if (verifiedDone) return;
+  turnstileToken = token;
+  submitBtn.disabled = false;
+}
 document.getElementById("verify-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (verifiedDone || submitting) return;
+  if (!turnstileToken) {
+    document.getElementById("status").textContent = "⚠️ 请先完成人机验证挑战。";
+    return;
+  }
+  submitting = true;
+  submitBtn.disabled = true;
   const status = document.getElementById("status");
   status.textContent = "正在校验，请稍候…";
   const resp = await fetch("/api/verify-turnstile", {
@@ -443,10 +464,14 @@ document.getElementById("verify-form").addEventListener("submit", async (e) => {
     body: JSON.stringify({ verifyId: "${verifyId}", userId: "${userId}", token: turnstileToken })
   });
   const data = await resp.json().catch(() => ({}));
-  if (resp.ok && data.ok) {
-    status.textContent = "✅ 验证成功，请返回 Telegram。";
+  if (resp.ok && data.ok && data.already_verified) {
+    setVerifiedUI("✅ 已验证（请返回 Telegram）。");
+  } else if (resp.ok && data.ok) {
+    setVerifiedUI("✅ 验证成功，请返回 Telegram。");
   } else {
     status.textContent = "❌ 验证失败，请返回 Telegram 重试。";
+    submitBtn.disabled = false;
+    submitting = false;
   }
 });
 </script>
@@ -516,6 +541,11 @@ export default {
             const token = String(body?.token || "");
             if (!verifyId || !userId || !token) {
                 return Response.json({ ok: false, error: "missing_params" }, { status: 400 });
+            }
+
+            const verifyStatus = await normalizedEnv.TOPIC_MAP.get(`verified:${userId}`);
+            if (verifyStatus) {
+                return Response.json({ ok: true, already_verified: true });
             }
 
             const state = await safeGetJSON(normalizedEnv, `chal:${verifyId}`, null);
