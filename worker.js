@@ -32,8 +32,7 @@ const topicCreateInFlight = new Map();
 // 管理员权限缓存（实例内）
 const adminStatusCache = new Map();
 
-// --- Turnstile 配置说明 ---
-// 需要环境变量：TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY / VERIFY_BASE_URL(可选)
+// --- Turnstile only, no local question bank ---
 
 // --- 辅助工具函数 ---
 
@@ -265,7 +264,7 @@ async function resetUserVerificationAndRequireReverify(env, { userId, userKey, o
         reason
     });
 
-    await sendVerificationChallenge(userId, env, pendingMsgId || null, null);
+    await sendVerificationChallenge(userId, env, pendingMsgId || null, request);
 }
 
 function parseAdminIdAllowlist(env) {
@@ -317,97 +316,6 @@ async function isAdminUser(env, userId) {
     }
 }
 
-
-
-function getBaseUrl(env, request) {
-    if (env.VERIFY_BASE_URL) return String(env.VERIFY_BASE_URL).replace(/\/$/, '');
-    const u = new URL(request.url);
-    return `${u.protocol}//${u.host}`;
-}
-
-function renderTurnstilePage(siteKey, sessionId) {
-    return `<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Telegram 验证</title>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0b1220;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.card{background:#131c31;border:1px solid #253250;border-radius:16px;padding:24px;max-width:420px;width:100%;box-sizing:border-box}.small{color:#9fb0d0;font-size:14px}button{width:100%;padding:12px;border-radius:10px;border:0;background:#4f8cff;color:#fff;font-size:16px;cursor:pointer}button:disabled{opacity:.6}#msg{margin-top:14px;white-space:pre-wrap}
-</style>
-</head><body><div class="card"><h2>人机验证</h2><p class="small">完成验证后，回到 Telegram 即可继续发送消息。</p><form id="f"><input type="hidden" name="sessionId" value="${sessionId}" /><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="dark"></div><div style="height:16px"></div><button type="submit">提交验证</button></form><div id="msg"></div></div><script>const form=document.getElementById('f');const msg=document.getElementById('msg');form.addEventListener('submit',async(e)=>{e.preventDefault();const fd=new FormData(form);const token=fd.get('cf-turnstile-response');const sessionId=fd.get('sessionId');if(!token){msg.textContent='请先完成人机验证';return;}msg.textContent='正在提交，请稍候...';const r=await fetch('/verify/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId,token})});const j=await r.json().catch(()=>({ok:false,error:'bad_json'}));msg.textContent=j.ok?'验证成功，请回到 Telegram 继续发送消息。':'验证失败：'+(j.error||'unknown');});</script></body></html>`;
-}
-
-async function verifyTurnstileToken(env, token, remoteip) {
-    const form = new URLSearchParams();
-    form.set('secret', String(env.TURNSTILE_SECRET_KEY || ''));
-    form.set('response', token);
-    if (remoteip) form.set('remoteip', remoteip);
-    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: form.toString()
-    });
-    return res.json();
-}
-
-async function handleVerifyPage(request, env) {
-    if (!env.TURNSTILE_SITE_KEY) return new Response('TURNSTILE_SITE_KEY not set', { status: 500 });
-    const url = new URL(request.url);
-    const sessionId = url.searchParams.get('session');
-    if (!sessionId) return new Response('missing session', { status: 400 });
-    const state = await safeGetJSON(env, `chal:${sessionId}`, null);
-    if (!state) return new Response('session expired', { status: 410 });
-    return new Response(renderTurnstilePage(String(env.TURNSTILE_SITE_KEY), sessionId), { headers: { 'content-type': 'text/html; charset=utf-8' } });
-}
-
-async function handleVerifySubmit(request, env, ctx) {
-    if (!env.TURNSTILE_SECRET_KEY) return Response.json({ ok: false, error: 'missing_secret' }, { status: 500 });
-    const body = await request.json().catch(() => null);
-    if (!body || !body.sessionId || !body.token) return Response.json({ ok: false, error: 'bad_request' }, { status: 400 });
-    const verifyId = body.sessionId;
-    const stateStr = await env.TOPIC_MAP.get(`chal:${verifyId}`);
-    if (!stateStr) return Response.json({ ok: false, error: 'session_expired' }, { status: 410 });
-    let state;
-    try { state = JSON.parse(stateStr); } catch { return Response.json({ ok: false, error: 'bad_state' }, { status: 500 }); }
-    const remoteip = request.headers.get('CF-Connecting-IP') || undefined;
-    const result = await verifyTurnstileToken(env, body.token, remoteip);
-    if (!result.success) return Response.json({ ok: false, error: 'turnstile_failed', codes: result['error-codes'] || [] }, { status: 400 });
-
-    const userId = state.userId;
-    await env.TOPIC_MAP.put(`verified:${userId}`, '1', { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
-    await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
-    await env.TOPIC_MAP.delete(`chal:${verifyId}`);
-    await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
-
-    try {
-        await tgCall(env, 'sendMessage', { chat_id: userId, text: '✅ 验证成功，您现在可以自由对话了。' });
-        const hasPending = Array.isArray(state.pending_ids) && state.pending_ids.length > 0;
-        if (hasPending) {
-            let pendingIds = state.pending_ids.slice();
-            if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
-            let forwardedCount = 0;
-            for (const pendingId of pendingIds) {
-                if (!pendingId) continue;
-                const forwardedKey = `forwarded:${userId}:${pendingId}`;
-                const alreadyForwarded = await env.TOPIC_MAP.get(forwardedKey);
-                if (alreadyForwarded) continue;
-                const fakeMsg = { message_id: pendingId, chat: { id: userId, type: 'private' }, from: { id: userId } };
-                await forwardToTopic(fakeMsg, userId, `user:${userId}`, env, ctx);
-                await env.TOPIC_MAP.put(forwardedKey, '1', { expirationTtl: 3600 });
-                forwardedCount++;
-            }
-            if (forwardedCount > 0) {
-                await tgCall(env, 'sendMessage', { chat_id: userId, text: `📩 刚才的 ${forwardedCount} 条消息已帮您送达。` });
-            }
-        }
-    } catch (e) {
-        Logger.error('turnstile_post_verify_failed', e, { userId });
-    }
-    return Response.json({ ok: true });
-}
 // 获取所有 KV keys（处理分页）
 async function getAllKeys(env, prefix) {
     const allKeys = [];
@@ -446,6 +354,58 @@ async function checkRateLimit(userId, env, action = 'message', limit = 20, windo
     return { allowed: true, remaining: limit - count - 1 };
 }
 
+
+function getBaseUrl(env, request) {
+    if (env.VERIFY_BASE_URL) return String(env.VERIFY_BASE_URL).replace(/\/$/, '');
+    const u = new URL(request.url);
+    return `${u.protocol}//${u.host}`;
+}
+
+function renderTurnstilePage(siteKey, sessionId) {
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Telegram 验证</title><script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script><style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0b1220;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.card{background:#131c31;border:1px solid #253250;border-radius:16px;padding:24px;max-width:420px;width:100%;box-sizing:border-box}.small{color:#9fb0d0;font-size:14px}button{width:100%;padding:12px;border-radius:10px;border:0;background:#4f8cff;color:#fff;font-size:16px;cursor:pointer}#msg{margin-top:14px;white-space:pre-wrap}</style></head><body><div class="card"><h2>人机验证</h2><p class="small">完成验证后，回到 Telegram 即可继续发送消息。</p><form id="f"><input type="hidden" name="sessionId" value="${sessionId}" /><div class="cf-turnstile" data-sitekey="${siteKey}" data-theme="dark"></div><div style="height:16px"></div><button type="submit">提交验证</button></form><div id="msg"></div></div><script>const form=document.getElementById('f');const msg=document.getElementById('msg');form.addEventListener('submit',async(e)=>{e.preventDefault();const fd=new FormData(form);const token=fd.get('cf-turnstile-response');const sessionId=fd.get('sessionId');if(!token){msg.textContent='请先完成人机验证';return;}msg.textContent='正在提交，请稍候...';const r=await fetch('/verify/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId,token})});const j=await r.json().catch(()=>({ok:false,error:'bad_json'}));msg.textContent=j.ok?'验证成功，请回到 Telegram 继续发送消息。':'验证失败：'+(j.error||'unknown');});</script></body></html>`;
+}
+
+async function verifyTurnstileToken(env, token, remoteip) {
+    const form = new URLSearchParams();
+    form.set('secret', String(env.TURNSTILE_SECRET_KEY || ''));
+    form.set('response', token);
+    if (remoteip) form.set('remoteip', remoteip);
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form.toString() });
+    return res.json();
+}
+
+async function handleVerifyPage(request, env) {
+    if (!env.TURNSTILE_SITE_KEY) return new Response('TURNSTILE_SITE_KEY not set', { status: 500 });
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get('session');
+    if (!sessionId) return new Response('missing session', { status: 400 });
+    const state = await safeGetJSON(env, `chal:${sessionId}`, null);
+    if (!state) return new Response('session expired', { status: 410 });
+    return new Response(renderTurnstilePage(String(env.TURNSTILE_SITE_KEY), sessionId), { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+async function handleVerifySubmit(request, env) {
+    if (!env.TURNSTILE_SECRET_KEY) return Response.json({ ok: false, error: 'missing_secret' }, { status: 500 });
+    const body = await request.json().catch(() => null);
+    if (!body || !body.sessionId || !body.token) return Response.json({ ok: false, error: 'bad_request' }, { status: 400 });
+    const verifyId = body.sessionId;
+    const state = await safeGetJSON(env, `chal:${verifyId}`, null);
+    if (!state) return Response.json({ ok: false, error: 'session_expired' }, { status: 410 });
+    const remoteip = request.headers.get('CF-Connecting-IP') || undefined;
+    const result = await verifyTurnstileToken(env, body.token, remoteip);
+    if (!result.success) return Response.json({ ok: false, error: 'turnstile_failed', codes: result['error-codes'] || [] }, { status: 400 });
+    const userId = state.userId;
+    await env.TOPIC_MAP.put(`verified:${userId}`, '1', { expirationTtl: CONFIG.VERIFIED_EXPIRE_SECONDS });
+    await env.TOPIC_MAP.delete(`needs_verify:${userId}`);
+    await env.TOPIC_MAP.delete(`chal:${verifyId}`);
+    await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
+    await tgCall(env, 'sendMessage', { chat_id: userId, text: '✅ 验证成功，现在可以继续发送消息了。' });
+    if (Array.isArray(state.pending_ids) && state.pending_ids.length > 0) {
+        await tgCall(env, 'sendMessage', { chat_id: userId, text: `你刚才有 ${state.pending_ids.length} 条待发送消息，请重新发送一次。` });
+    }
+    return Response.json({ ok: true });
+}
+
 export default {
   async fetch(request, env, ctx) {
     // 环境自检
@@ -470,7 +430,7 @@ export default {
 
     const url = new URL(request.url);
     if (request.method === 'GET' && url.pathname === '/verify') return handleVerifyPage(request, normalizedEnv);
-    if (request.method === 'POST' && url.pathname === '/verify/submit') return handleVerifySubmit(request, normalizedEnv, ctx);
+    if (request.method === 'POST' && url.pathname === '/verify/submit') return handleVerifySubmit(request, normalizedEnv);
 
     if (request.method !== "POST") return new Response("OK");
 
@@ -574,10 +534,10 @@ async function handlePrivateMessage(msg, env, ctx, request) {
     return;
   }
 
-  await forwardToTopic(msg, userId, key, env, ctx, request);
+  await forwardToTopic(msg, userId, key, env, ctx);
 }
 
-async function forwardToTopic(msg, userId, key, env, ctx, request) {
+async function forwardToTopic(msg, userId, key, env, ctx) {
     // 并发兜底：如果已被标记为需要重新验证，直接发起验证并暂停转发/建话题
     const needsVerify = await env.TOPIC_MAP.get(`needs_verify:${userId}`);
     if (needsVerify) {
@@ -892,112 +852,54 @@ async function handleAdminReply(msg, env, ctx) {
 
 // ---------------- 验证模块 (纯本地) ----------------
 
-async function sendVerificationChallenge(userId, env, pendingMsgId) {
-    // 【修复 #1】检查是否已有进行中的验证
+async function sendVerificationChallenge(userId, env, pendingMsgId, request) {
     const existingChallenge = await env.TOPIC_MAP.get(`user_challenge:${userId}`);
     if (existingChallenge) {
-        // 有正在进行的验证：仅将新消息加入待发送队列，避免重复下发题目/触发验证限速
         const chalKey = `chal:${existingChallenge}`;
         const state = await safeGetJSON(env, chalKey, null);
-
-        // KV 可能存在不一致/过期：自愈清理后重新下发
         if (!state || state.userId !== userId) {
             await env.TOPIC_MAP.delete(`user_challenge:${userId}`);
         } else {
             if (pendingMsgId) {
-                let pendingIds = [];
-                if (Array.isArray(state.pending_ids)) {
-                    pendingIds = state.pending_ids.slice();
-                } else if (state.pending) {
-                    pendingIds = [state.pending];
-                }
-
+                let pendingIds = Array.isArray(state.pending_ids) ? state.pending_ids.slice() : [];
                 if (!pendingIds.includes(pendingMsgId)) {
                     pendingIds.push(pendingMsgId);
-                    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) {
-                        pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
-                    }
+                    if (pendingIds.length > CONFIG.PENDING_MAX_MESSAGES) pendingIds = pendingIds.slice(pendingIds.length - CONFIG.PENDING_MAX_MESSAGES);
                     state.pending_ids = pendingIds;
-                    delete state.pending;
-                    await env.TOPIC_MAP.put(chalKey, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
+                    await env.TOPIC_MAP.put(chalKey, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_SESSION_TTL_SECONDS });
                 }
             }
-            Logger.debug('verification_duplicate_skipped', { userId, verifyId: existingChallenge, hasPending: !!pendingMsgId });
             return;
         }
     }
-
-    // 验证请求速率限制：仅在需要创建新挑战时检查
     const verifyLimit = await checkRateLimit(userId, env, 'verify', CONFIG.RATE_LIMIT_VERIFY, 300);
     if (!verifyLimit.allowed) {
-        await tgCall(env, "sendMessage", {
-            chat_id: userId,
-            text: "⚠️ 验证请求过于频繁，请5分钟后再试。"
-        });
+        await tgCall(env, 'sendMessage', { chat_id: userId, text: '⚠️ 验证请求过于频繁，请5分钟后再试。' });
         return;
     }
-
-    // 【修复 #9】使用加密安全的随机数
-    const q = LOCAL_QUESTIONS[secureRandomInt(0, LOCAL_QUESTIONS.length)];
-    const challenge = {
-        question: q.question,
-        correct: q.correct_answer,
-        options: shuffleArray([...q.incorrect_answers, q.correct_answer])
-    };
-
-    // 【修复 #9】使用加密安全的ID生成
     const verifyId = secureRandomId(CONFIG.VERIFY_ID_LENGTH);
-
-    // 【修复 #6】使用答案索引而非文本，避免截断问题
-    const answerIndex = challenge.options.indexOf(challenge.correct);
-
-    const state = {
-        answerIndex: answerIndex,      // 存储索引
-        options: challenge.options,     // 存储完整选项列表
-        pending_ids: pendingMsgId ? [pendingMsgId] : [],
-        userId: userId                  // 添加用户ID验证
-    };
-
-    await env.TOPIC_MAP.put(`chal:${verifyId}`, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
-
-    // 【修复 #1】标记用户正在验证中
-    await env.TOPIC_MAP.put(`user_challenge:${userId}`, verifyId, { expirationTtl: CONFIG.VERIFY_EXPIRE_SECONDS });
-
-    Logger.info('verification_sent', {
-        userId,
-        verifyId,
-        question: q.question,
-        pendingCount: state.pending_ids.length
-    });
-
-    // 【修复 #6】按钮使用索引而非文本
-    const buttons = challenge.options.map((opt, idx) => ({
-        text: opt,
-        callback_data: `verify:${verifyId}:${idx}`  // 使用索引
-    }));
-
-    const keyboard = [];
-    for (let i = 0; i < buttons.length; i += CONFIG.BUTTON_COLUMNS) {
-        keyboard.push(buttons.slice(i, i + CONFIG.BUTTON_COLUMNS));
-    }
-
-    await tgCall(env, "sendMessage", {
+    const state = { pending_ids: pendingMsgId ? [pendingMsgId] : [], userId };
+    await env.TOPIC_MAP.put(`chal:${verifyId}`, JSON.stringify(state), { expirationTtl: CONFIG.VERIFY_SESSION_TTL_SECONDS });
+    await env.TOPIC_MAP.put(`user_challenge:${userId}`, verifyId, { expirationTtl: CONFIG.VERIFY_SESSION_TTL_SECONDS });
+    const baseUrl = getBaseUrl(env, request);
+    const verifyUrl = `${baseUrl}/verify?session=${encodeURIComponent(verifyId)}`;
+    await tgCall(env, 'sendMessage', {
         chat_id: userId,
-        text: `🛡️ **人机验证**\n\n${challenge.question}\n\n请点击下方按钮回答 (回答正确后将自动发送您刚才的消息)。`,
-        parse_mode: "Markdown",
-        reply_markup: { inline_keyboard: keyboard }
+        text: `🛡️ **人机验证**
+
+请点击下方链接完成 Cloudflare Turnstile 验证：
+${verifyUrl}
+
+验证通过后即可继续对话。`,
+        parse_mode: 'Markdown'
     });
 }
 
 async function handleCallbackQuery(query, env, ctx) {
     try {
         const data = query.data || '';
-        if (!data.startsWith("verify:")) return;
-        await tgCall(env, "answerCallbackQuery", {
-            callback_query_id: query.id,
-            text: "请打开验证链接完成验证",
-            show_alert: true
-        });
+        if (!data.startsWith('verify:')) return;
+        await tgCall(env, 'answerCallbackQuery', { callback_query_id: query.id, text: '请使用验证链接完成人机验证', show_alert: true });
     } catch (e) {
         Logger.error('callback_query_error', e, { userId: query.from?.id, callbackData: query.data });
     }
